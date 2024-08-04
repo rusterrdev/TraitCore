@@ -1,8 +1,25 @@
 local CollectionService = game:GetService("CollectionService")
+local LocalizationService = game:GetService("LocalizationService")
+local ProximityPromptService = game:GetService("ProximityPromptService")
 local Promise = require(script.Dependencies.promise)
 local Signal = require(script.Dependencies.signal)
 
 local uniqueIdentifiers = {}
+
+--> Constants
+
+
+local LogLevels = {
+    DEBUG = 1,
+    INFO = 2,
+    WARNING = 3,
+    ERROR = 4,
+}
+
+
+--> Classes
+
+
 
 --[=[
     @class TraitCore
@@ -17,12 +34,15 @@ local uniqueIdentifiers = {}
     traitCore:fetchAsync(instance)
     ```
 
-    base class
+    Super Class
 ]=]
+
 
 local TraitCore: TraitCore = {
     _entity_tags = {},
-    _query_manager = setmetatable({}, {
+    _query_manager = setmetatable({
+        QueryPropsFilter = {'identifier'}
+    }, {
         __tostring = function()
             return `QUERY_MANAGER_SUB_CLASS`
         end
@@ -36,11 +56,61 @@ setmetatable(TraitCore, {
     end
 })
 
+
+
+--> Functions
+
+
+
+
+local function log(info: string, level: number, err: string?)
+    err = if err then err else ""
+
+    local level_tags = {
+        --[LogLevels.DEBUG] = "DEBUG",
+        [LogLevels.INFO] = "INFO",
+        [LogLevels.WARNING] = "WARNING",
+        --[LogLevels.ERROR] = "ERROR",
+    }
+
+    local level_tag = level_tags[level] or "UNKNOWN"
+    print(`"[{level_tag}]": {info}\n`, err)
+end
+
+local function checkSingleProp(instance: Instance, prop: string) 
+    return Promise.try(function()
+        return instance[prop] ~= nil
+    end)
+end
+
+
+local function checkProps(
+    instance: Instance,
+    info,
+    object
+)
+    local okay = false
+    
+    for property, value in info do
+        if value == nil then continue end
+        if typeof(value) == 'table' then continue end
+        if table.find(object._query_manager.QueryPropsFilter, property) then continue end
+        if not checkSingleProp(instance, property) then return end
+        if instance[property] ~= value then return end
+    end
+
+    okay = true
+
+    return okay
+end
+
+
 --[=[
     @param traitIdentifier string
     @param handlerCallback : (selfObject: TraitCore?, entityInstance: Instance) -> ()
     @return Trait
 ]=]
+
 
 function TraitCore.newTrait(traitIdentifier, handlerCallback): Trait
     assert(type(traitIdentifier) == "string", "traitIdentifier must be a string")
@@ -50,19 +120,49 @@ function TraitCore.newTrait(traitIdentifier, handlerCallback): Trait
     local self = setmetatable({
         _identifier = traitIdentifier,
         _handlerCallback = handlerCallback,
-        _builded_signal = Signal.new(),       
+        _builded_signal = Signal.new(),      
+        _builded = false,
 
     }, {__index = TraitCore, __mode = "k"})
 
     local meta = getmetatable(self)
 
-    function meta:__tostring()
+    --[[function meta:__tostring()
         return `TRAIT_CORE TRAIT: '{traitIdentifier}'`
+    end]]
+
+    local function build(instance)
+        if self._builded then return end
+        self._handlerCallback(self, instance)
+        self._builded = true
+
+        if not self._entity_tags[self._identifier] then self._entity_tags[self._identifier] = {} end
     end
 
     self._builded_signal:Connect(function(instance)
-        self._handlerCallback(self, instance)
+        build(instance)
     end)
+
+    coroutine.wrap(function()
+
+        CollectionService:GetInstanceAddedSignal(self._identifier):Connect(function(instance)
+            build(instance)
+            if table.find(self._entity_tags[self._identifier], instance) then return end
+            CollectionService:AddTag(instance, self._identifier)
+            table.insert(self._entity_tags[self._identifier], instance)
+        end)
+
+        local withTagInstances = CollectionService:GetTagged(self._identifier)
+
+        for _, taggedInstance in withTagInstances do
+            build(taggedInstance)
+            if table.find(self._entity_tags[self._identifier], taggedInstance) then continue end
+            CollectionService:AddTag(taggedInstance, self._identifier)
+            table.insert(self._entity_tags[self._identifier], taggedInstance)
+        end
+
+    end)()
+
 
     uniqueIdentifiers[traitIdentifier] = true
     self._entity_tags[traitIdentifier] = {}
@@ -70,9 +170,14 @@ function TraitCore.newTrait(traitIdentifier, handlerCallback): Trait
     return self
 end
 
+
+--> Methods
+
+
 --[=[
     @param trait Trait
     @return void
+
     destroy ```trait```
 ]=]
 
@@ -82,9 +187,21 @@ function TraitCore:cleanupTrait(trait: Trait)
     self._entity_tags[trait._identifier] = nil
 end
 
+function TraitCore:find(instance: Instance): Instance
+    assert(instance and instance:IsA("Instance"), "Invalid instance")
+    local result, index = self:isAssociated(instance)
+    if not index then return end
+
+    return self._entity_tags[self._identifier][index]
+end
+
 --[=[
     @param instance Instance
     @return void
+    :::caution
+    this method will remove the ```Trait``` instance.
+    :::
+
     remove ```instance``` from trait
 ]=]
 
@@ -98,11 +215,16 @@ end
 --[=[
     @param instance Instance
     @return boolean
+    :::info
+      ```Trait:isAssociated()``` is similar to ```Trait:find()```. except that ```Trait:isAssociated()```, returns a tuple. containing a ```boolean``` and a ```number?```, which is the index of the instance in the Trait.
+    :::
+
     returns whether the ```instance``` is part of the trait.
 ]=]
 
-function TraitCore:isAssociated(instance: Instance): boolean
-    return table.find(self._entity_tags[self._identifier], instance) ~= nil
+function TraitCore:isAssociated(instance: Instance): (boolean, number?)
+    local index = table.find(self._entity_tags[self._identifier], instance)
+    return  index ~= nil, index
 end
 
 --[=[
@@ -134,23 +256,41 @@ end
 ]=]
 
 
-function TraitCore:query(identifier: string)
-    assert(type(identifier) == "string", "identifier must be a string")
+
+
+function TraitCore:query(info: {})
+    local identifier = info.identifier
+    assert(typeof(info.tags) == "table", "identifier must be a table.")
+    
+    for _, tag in info.tags do
+        assert(self._entity_tags[tag], `query for non-existent tag: "{tag}"`)
+    end
+
     local Self = self
 
     function self._query_manager:track(listener)
         Self.track:Connect(listener)
     end
+   
+
     function self._query_manager:get()
-        return Self._entity_tags[identifier]
+        local entityArray = {}
+        for index, entityTag in Self._entity_tags do
+            for _, entity in entityTag do
+                if table.find(info.tags, index) and checkProps(entity, info, Self) and not table.find(entityArray, entity) then table.insert(entityArray, entity) end 
+            end
+        end
+        return table.clone(entityArray) or {}
     end
 
-    return self._query_manager
+    return table.freeze(self._query_manager)
 end
 
 --[=[
     @param instance Instance
     @return Promise
+    @within TraitCore
+
     have a promise , to add the ```instance``` to the trait. and also returns such a promise.
 
     ```lua
@@ -179,24 +319,24 @@ function TraitCore:fetchAsync(instance: Instance)
         self._builded_signal:Fire(instance)
         self.track:Fire(self, instance)
     end):catch(function(err)
-        warn("Failed to fetchAsync: " .. tostring(err))
+        log("failed to fetchAsync", 2, err)
     end)
 
    return handleBuild
 end
 
+
 --[=[
     @param instance Instance
     @return ()
-
+    @yields
+    
     Pauses the current thread, until an instance is linked to Trait.
 
     ```lua
         local TraitCore = require(PATH_TO_TRAIT_CORE)
         
-        local trait = TraitCore.newTrait("example", function(self, instance)
-
-        end)
+        local trait = TraitCore.newTrait("example", function(self, instance) end)
         
         local part = Instance.new("Part")
         
@@ -209,6 +349,7 @@ end
     ```
 ]=]
 
+
 function TraitCore:await(instance: Instance)
     assert(instance and instance:IsA("Instance"), "Invalid instance")
 
@@ -220,6 +361,9 @@ function TraitCore:await(instance: Instance)
         if entityIndex then return self._entity_tags[self._identifier][entityIndex] end
     end
 end
+
+
+--> Types
 
 
 type Promise = typeof(Promise.new())
@@ -247,10 +391,12 @@ export type TraitCore = {
 --- @type Trait = { fetchAsync: (self: Trait, instance: Instance) -> Promise, await: (self: Trait, instance: Instance) -> Instance?, isAssociated: (self: Trait, instance: Instance) -> boolean }
 --- @within TraitCore
 
+
 export type Trait = {
     fetchAsync: (self: Trait, instance: Instance) -> Promise,
     await: (self: Trait, instance: Instance) -> Instance?,
-    isAssociated: (self: Trait, instance: Instance) -> boolean,
+    isAssociated: (self: Trait, instance: Instance) -> (boolean, number?),
+    find: (self: Trait, instance: Instance) -> Instance?,
 }   
 
 
