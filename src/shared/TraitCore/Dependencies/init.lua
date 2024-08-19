@@ -1,24 +1,15 @@
+--!native
+--!nolint 
+--!nocheck
+
 local CollectionService = game:GetService("CollectionService")
 local LocalizationService = game:GetService("LocalizationService")
 local ProximityPromptService = game:GetService("ProximityPromptService")
+
 local Promise = require(script.Dependencies.promise)
 local Signal = require(script.Dependencies.signal)
 
 local uniqueIdentifiers = {}
-
---> Constants
-
-
-local LogLevels = {
-    DEBUG = 1,
-    INFO = 2,
-    WARNING = 3,
-    ERROR = 4,
-}
-
-
---> Classes
-
 
 
 --[=[
@@ -39,43 +30,21 @@ local LogLevels = {
 
 
 local TraitCore: TraitCore = {
-    _entity_tags = {},
+    _tagged_entities = {},
     _query_manager = setmetatable({
-        QueryPropsFilter = {'identifier'}
+        QueryPropsFilter = {'identifier'},
+        _track_listeners = {},
     }, {
-        __tostring = function()
-            return `QUERY_MANAGER_SUB_CLASS`
-        end
+    
     }),
     track = Signal.new(),
 } :: TraitCore
-
-setmetatable(TraitCore, {
-    __tostring = function()
-        return `TRAIT_CORE_CLASS`
-    end
-})
-
 
 
 --> Functions
 
 
 
-
-local function log(info: string, level: number, err: string?)
-    err = if err then err else ""
-
-    local level_tags = {
-        --[LogLevels.DEBUG] = "DEBUG",
-        [LogLevels.INFO] = "INFO",
-        [LogLevels.WARNING] = "WARNING",
-        --[LogLevels.ERROR] = "ERROR",
-    }
-
-    local level_tag = level_tags[level] or "UNKNOWN"
-    print(`"[{level_tag}]": {info}\n`, err)
-end
 
 local function checkSingleProp(instance: Instance, prop: string) 
     return Promise.try(function()
@@ -123,49 +92,57 @@ function TraitCore.newTrait(traitIdentifier, handlerCallback): Trait
         _builded_signal = Signal.new(),      
         _builded = false,
 
-    }, {__index = TraitCore, __mode = "k"})
+    }, {__index = TraitCore})
 
-    local meta = getmetatable(self)
-
-    --[[function meta:__tostring()
-        return `TRAIT_CORE TRAIT: '{traitIdentifier}'`
-    end]]
-
-    local function build(instance)
+    local function buildInstanceWithTag(instance)
         if self._builded then return end
-        self._handlerCallback(self, instance)
+        task.spawn(self._handlerCallback, self, instance)
         self._builded = true
 
-        if not self._entity_tags[self._identifier] then self._entity_tags[self._identifier] = {} end
+        if not self._tagged_entities[self._identifier] then self._tagged_entities[self._identifier] = {} end
     end
 
     self._builded_signal:Connect(function(instance)
-        build(instance)
+        buildInstanceWithTag(instance)
     end)
 
-    coroutine.wrap(function()
+    task.spawn(function()
 
         CollectionService:GetInstanceAddedSignal(self._identifier):Connect(function(instance)
-            build(instance)
-            if table.find(self._entity_tags[self._identifier], instance) then return end
+            buildInstanceWithTag(instance)
+            
+            if table.find(self._tagged_entities[self._identifier], instance) then return end
+            
             CollectionService:AddTag(instance, self._identifier)
-            table.insert(self._entity_tags[self._identifier], instance)
+            table.insert(self._tagged_entities[self._identifier], instance)
         end)
 
-        local withTagInstances = CollectionService:GetTagged(self._identifier)
+        CollectionService:GetInstanceRemovedSignal(self._identifier):Connect(function(instance)
+            if not instance then return end
 
-        for _, taggedInstance in withTagInstances do
-            build(taggedInstance)
-            if table.find(self._entity_tags[self._identifier], taggedInstance) then continue end
+            local index = table.find(self._tagged_entities[self._identifier], instance) 
+            
+            if not index then return end
+
+            self._tagged_entities[self._identifier][index] = nil
+        end)
+
+        local taggedInstances = CollectionService:GetTagged(self._identifier)
+
+        for _, taggedInstance in taggedInstances do
+            
+            buildInstanceWithTag(taggedInstance)
+
+            if table.find(self._tagged_entities[self._identifier], taggedInstance) then continue end
+            
             CollectionService:AddTag(taggedInstance, self._identifier)
-            table.insert(self._entity_tags[self._identifier], taggedInstance)
+            table.insert(self._tagged_entities[self._identifier], taggedInstance)
         end
 
-    end)()
-
+    end)
 
     uniqueIdentifiers[traitIdentifier] = true
-    self._entity_tags[traitIdentifier] = {}
+    self._tagged_entities[traitIdentifier] = {}
 
     return self
 end
@@ -184,7 +161,7 @@ end
 function TraitCore:cleanupTrait(trait: Trait)    
     uniqueIdentifiers[trait._identifier] = nil
     trait = nil
-    self._entity_tags[trait._identifier] = nil
+    self._tagged_entities[trait._identifier] = nil
 end
 
 function TraitCore:find(instance: Instance): Instance
@@ -192,7 +169,7 @@ function TraitCore:find(instance: Instance): Instance
     local result, index = self:isAssociated(instance)
     if not index then return end
 
-    return self._entity_tags[self._identifier][index]
+    return self._tagged_entities[self._identifier][index]
 end
 
 --[=[
@@ -207,9 +184,9 @@ end
 
 
 function TraitCore:removeInstance(instance: Instance)
-    local instanceIndexTrait = table.find(self._entity_tags[self._identifier], instance)
+    local instanceIndexTrait = table.find(self._tagged_entities[self._identifier], instance)
     if not instanceIndexTrait then return end
-    table.remove(self._entity_tags[self._identifier], instanceIndexTrait)
+    return table.remove(self._tagged_entities[self._identifier], instanceIndexTrait)
 end
 
 --[=[
@@ -223,12 +200,12 @@ end
 ]=]
 
 function TraitCore:isAssociated(instance: Instance): (boolean, number?)
-    local index = table.find(self._entity_tags[self._identifier], instance)
+    local index = table.find(self._tagged_entities[self._identifier], instance)
     return  index ~= nil, index
 end
 
 --[=[
-    @param identifier string
+    @param info (info: {[string?] : any?} & {tags: {string}})
     @return QueryManager
 
     ```lua
@@ -239,9 +216,13 @@ end
             part.Size = Vector3.new(3,3,3)
         end)
         
+        local requirements = {"example", Color = Color3.new(1,0,0)}
+
+        local QueryManager = TraitCore:query(requirements)
+
         task.spawn(function()
             trait:await(part)
-            print(TraitCore:query("example"):get()) -->> {[1]: Part}
+           print(QueryManager:get()) --> returns instances with the specified requirements
 
         end)
 
@@ -263,21 +244,25 @@ function TraitCore:query(info: {})
     assert(typeof(info.tags) == "table", "identifier must be a table.")
     
     for _, tag in info.tags do
-        assert(self._entity_tags[tag], `query for non-existent tag: "{tag}"`)
+        assert(self._tagged_entities[tag], `query for non-existent tag: "{tag}"`)
     end
 
     local Self = self
 
     function self._query_manager:track(listener)
-        Self.track:Connect(listener)
+        Self.track:Connect(function(_, instance)
+            if not checkProps(instance, info, Self) then return end
+            task.spawn(listener, Self, instance)
+            --makeConn()
+            print(_, instance, "   track")
+        end)  
     end
-   
 
     function self._query_manager:get()
         local entityArray = {}
-        for index, entityTag in Self._entity_tags do
+        for index, entityTag in Self._tagged_entities do
             for _, entity in entityTag do
-                if table.find(info.tags, index) and checkProps(entity, info, Self) and not table.find(entityArray, entity) then table.insert(entityArray, entity) end 
+                if table.find(info.tags, index) and checkProps(entity, info, Self) and not entityArray[entity] then entityArray[entity] = entity end 
             end
         end
         return table.clone(entityArray) or {}
@@ -310,19 +295,19 @@ end
 function TraitCore:fetchAsync(instance: Instance)
     assert(instance and instance:IsA("Instance"), "Invalid instance")
 
-    local handleBuild = Promise.try(function()
+    local wrapBuildPromise = Promise.try(function()
         CollectionService:AddTag(instance, self._identifier)
-        table.insert(self._entity_tags[self._identifier], instance)
+        table.insert(self._tagged_entities[self._identifier], instance)
     end)
 
-    handleBuild:andThen(function()
+    wrapBuildPromise:andThen(function()
         self._builded_signal:Fire(instance)
         self.track:Fire(self, instance)
+
     end):catch(function(err)
-        log("failed to fetchAsync", 2, err)
     end)
 
-   return handleBuild
+   return wrapBuildPromise
 end
 
 
@@ -357,8 +342,8 @@ function TraitCore:await(instance: Instance)
     until entityCreated == instance
 
     while true do
-        local entityIndex = table.find(self._entity_tags[self._identifier], instance)
-        if entityIndex then return self._entity_tags[self._identifier][entityIndex] end
+        local entityIndex = table.find(self._tagged_entities[self._identifier], instance)
+        if entityIndex then return self._tagged_entities[self._identifier][entityIndex] end
     end
 end
 
@@ -369,28 +354,16 @@ end
 type Promise = typeof(Promise.new())
 type Signal = typeof(Signal.new())
 
---- @type QueryManager {get: () -> {Instance},  track: (self: TraitCore, listener: (selfObject: TraitCore?, entityInstance: Instance) -> ()) -> ()}
---- @within TraitCore
---- Query Manager
 
 export type QueryManager = {
-    get: () -> {Instance},
-    track: (self: TraitCore, listener: (selfObject: TraitCore?, entityInstance: Instance) -> ()) -> (),
+    get: () -> {Instance?},
+    track: (self: QueryManager, listener: (selfObject: Trait, entityInstance: Instance) -> ()) -> (),
 }
-
-
---- @type TraitCore { newTrait = (traitIdentifier: string, handlerCallback: (selfObject: TraitCore?, entityInstance: Instance) -> ()) -> Trait, query = (self: TraitCore, identifier: string) -> QueryManager }
---- @within TraitCore
-
 
 export type TraitCore = {
-    newTrait: (traitIdentifier: string, handlerCallback: (selfObject: TraitCore?, entityInstance: Instance) -> ()) -> Trait,
-    query: (self: TraitCore, identifier: string) -> QueryManager
+    newTrait: (identifier: string, listener: (selfObject: Trait, entityInstance: Instance) -> ()) -> (),
+    query: <prop>(self: {}, info: {[prop] : any} & {tags: {string}}) -> QueryManager,
 }
-
---- @type Trait = { fetchAsync: (self: Trait, instance: Instance) -> Promise, await: (self: Trait, instance: Instance) -> Instance?, isAssociated: (self: Trait, instance: Instance) -> boolean }
---- @within TraitCore
-
 
 export type Trait = {
     fetchAsync: (self: Trait, instance: Instance) -> Promise,
@@ -400,5 +373,4 @@ export type Trait = {
 }   
 
 
-
-return table.freeze(TraitCore)
+return table.freeze(TraitCore) :: TraitCore
